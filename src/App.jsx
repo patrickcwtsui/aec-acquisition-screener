@@ -1,828 +1,1121 @@
-import React, { useMemo, useState } from "react";
+// src/App.jsx
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /**
- * AEC Acquisition Target Screener (Plain React) - Granular Responses Everywhere
- * - No Tailwind / no shadcn
+ * AEC Acquisition Target Screener
+ * - 3-column layout: Companies (left) / Score a company (middle) / Tier lists (right)
+ * - Company fields: name, revenue, employees, HQ location
+ * - 9 questions with granular responses (mapped to numeric scores)
+ * - Auto tiering + CSV export
  * - LocalStorage persistence
- * - CSV export
- * - 3-column layout: Companies (left) | Scoring (middle) | Tier lists (right)
- * - Data entry fields: Revenue, Employees, HQ Location in "Score a company"
- * - Left company list shows Revenue + Employees
- * - ALL questions use one of 4 granular dropdown sets:
- *    - fit5, risk5, momentum5, readiness5 (each has 6 options incl Unknown)
+ * - Optional password gate (bypassed on localhost)
  */
 
-const STORAGE_KEY = "aec-acq-screener:v4";
+/* ----------------------------- Auth Gate ----------------------------- */
+function AuthGate({ children }) {
+  const [checking, setChecking] = useState(true);
+  const [authed, setAuthed] = useState(false);
+  const [password, setPassword] = useState("");
+  const [err, setErr] = useState("");
 
-// ---------- Universal option sets (granular) ----------
-const OPTION_SETS = {
-  fit5: {
-    label: "Fit",
+  const isLocalhost =
+    typeof window !== "undefined" &&
+    (window.location.hostname === "localhost" ||
+      window.location.hostname === "127.0.0.1");
+
+  async function check() {
+    if (isLocalhost) {
+      setAuthed(true);
+      setChecking(false);
+      return;
+    }
+
+    setChecking(true);
+    setErr("");
+    try {
+      const r = await fetch("/api/me", { credentials: "include" });
+      const j = await r.json();
+      setAuthed(!!j.authed);
+    } catch {
+      setAuthed(false);
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  useEffect(() => {
+    check();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function login(e) {
+    e.preventDefault();
+    setErr("");
+    try {
+      const r = await fetch("/api/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ password }),
+      });
+      if (!r.ok) {
+        setErr("Wrong password.");
+        return;
+      }
+      setPassword("");
+      await check();
+    } catch {
+      setErr("Login failed. Try again.");
+    }
+  }
+
+  async function logout() {
+    if (isLocalhost) return;
+    await fetch("/api/logout", { credentials: "include" });
+    await check();
+  }
+
+  if (checking) {
+    return (
+      <div style={{ padding: 24, fontFamily: "system-ui" }}>
+        Checking access…
+      </div>
+    );
+  }
+
+  if (!authed) {
+    return (
+      <div style={styles.authWrap}>
+        <div style={styles.authCard}>
+          <div style={styles.authTitle}>Enter password</div>
+          <div style={styles.authSub}>This project is protected.</div>
+          <form onSubmit={login} style={{ display: "grid", gap: 10 }}>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="Password"
+              autoFocus
+              style={styles.input}
+            />
+            {err ? <div style={styles.err}>{err}</div> : null}
+            <button type="submit" style={styles.primaryBtn}>
+              Login
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div style={styles.logoutWrap}>
+        <button onClick={logout} style={styles.ghostBtn}>
+          Logout
+        </button>
+      </div>
+      {children}
+    </>
+  );
+}
+
+/* ----------------------------- Scoring Model ----------------------------- */
+/**
+ * 4 dimensions:
+ * - Fit (strategic + product adjacencies)
+ * - Risk (downside / diligence flags)
+ * - Momentum (growth / pull / timing)
+ * - Readiness (integration + process + data)
+ *
+ * Each question maps to ONE primary dimension.
+ */
+const DIMENSIONS = ["Fit", "Risk", "Momentum", "Readiness"];
+
+const QUESTIONS = [
+  {
+    key: "q1",
+    dimension: "Fit",
+    title: "Strategic adjacency to our platform",
+    prompt: "How directly does this target expand or strengthen our core AEC thesis?",
     options: [
-      { value: "ideal", label: "Ideal / Strong", score: 100 },
-      { value: "good", label: "Good", score: 80 },
-      { value: "ok", label: "Acceptable", score: 60 },
-      { value: "weak", label: "Weak", score: 30 },
-      { value: "red", label: "Red flag", score: 0 },
-      { value: "unknown", label: "Unknown", score: 35 },
+      { label: "Direct core adjacency (same buyer + workflow)", score: 10 },
+      { label: "Strong adjacency (shared buyer, nearby workflow)", score: 8 },
+      { label: "Moderate adjacency (some overlap)", score: 6 },
+      { label: "Weak adjacency (limited overlap)", score: 3 },
+      { label: "Not aligned / unclear", score: 0 },
     ],
   },
-  risk5: {
-    label: "Risk",
+  {
+    key: "q2",
+    dimension: "Fit",
+    title: "Product differentiation / defensibility",
+    prompt: "How unique is the product vs. alternatives?",
     options: [
-      { value: "low", label: "Low", score: 100 },
-      { value: "med", label: "Medium", score: 75 },
-      { value: "high", label: "High", score: 45 },
-      { value: "critical", label: "Critical", score: 15 },
-      { value: "deal", label: "Deal-breaker", score: 0 },
-      { value: "unknown", label: "Unknown", score: 35 },
+      { label: "Category-defining + hard to replicate moat", score: 10 },
+      { label: "Clear differentiation + defensible IP/data", score: 8 },
+      { label: "Some differentiation, but copyable", score: 6 },
+      { label: "Commodity-ish", score: 3 },
+      { label: "No differentiation", score: 0 },
     ],
   },
-  momentum5: {
-    label: "Momentum",
+  {
+    key: "q3",
+    dimension: "Momentum",
+    title: "Market pull & growth",
+    prompt: "What does demand look like right now?",
     options: [
-      { value: "strong", label: "Strong growth / expanding", score: 100 },
-      { value: "solid", label: "Solid growth", score: 80 },
-      { value: "stable", label: "Stable", score: 60 },
-      { value: "decline", label: "Declining", score: 25 },
-      { value: "struct", label: "Structural decline", score: 0 },
-      { value: "unknown", label: "Unknown", score: 35 },
+      { label: "Explosive pull (high inbound, short sales cycles)", score: 10 },
+      { label: "Strong pull (healthy pipeline + predictable growth)", score: 8 },
+      { label: "Stable pull (steady but not accelerating)", score: 6 },
+      { label: "Softening pull (growth slowing)", score: 3 },
+      { label: "No pull / shrinking", score: 0 },
     ],
   },
-  readiness5: {
-    label: "Readiness",
+  {
+    key: "q4",
+    dimension: "Momentum",
+    title: "Go-to-market efficiency",
+    prompt: "How efficient is the growth engine?",
     options: [
-      { value: "active", label: "Actively exploring / clear intent", score: 100 },
-      { value: "open", label: "Open to discussion", score: 80 },
-      { value: "unclear", label: "Unclear", score: 60 },
-      { value: "not", label: "Likely not for sale", score: 25 },
-      { value: "explicit", label: "Explicitly not for sale", score: 0 },
-      { value: "unknown", label: "Unknown", score: 35 },
-    ],
-  },
-};
-
-const DEFAULT_ANSWER = "unknown";
-
-// ---------- Weights / thresholds ----------
-const defaultWeights = {
-  strategy_fit: 22,
-  target_profile: 10,
-  sell_readiness: 18,
-  financial_quality: 16,
-  talent_delivery: 12,
-  culture_integration: 12,
-  competitive_dynamics: 6,
-  deal_feasibility: 4,
-};
-
-const defaultThresholds = { tier1: 78, tier2: 62 };
-
-// ---------- Sections & questions (all mapped to option sets) ----------
-const SECTIONS = [
-  {
-    id: "strategy_fit",
-    title: "Strategic Fit",
-    description:
-      "Does this target advance the acquisition thesis (capability, geography, clients, talent)?",
-    questions: [
-      { id: "thesis_alignment", label: "Alignment to thesis / target niche", set: "fit5" },
-      { id: "capability_gap", label: "Closes a high-priority capability gap", set: "fit5" },
-      { id: "client_access", label: "Improves access to priority clients / sectors", set: "fit5" },
-      { id: "geo_value", label: "Adds priority geography / platform foothold", set: "fit5" },
+      { label: "Best-in-class unit economics (efficient + scalable)", score: 10 },
+      { label: "Solid efficiency with scaling path", score: 8 },
+      { label: "Mixed efficiency, improvements needed", score: 6 },
+      { label: "Inefficient GTM", score: 3 },
+      { label: "Broken GTM / unclear economics", score: 0 },
     ],
   },
   {
-    id: "target_profile",
-    title: "Target Profile",
-    description:
-      "Does it fit your ideal target profile constraints (size, services, ownership structure)?",
-    questions: [
-      { id: "size_fit", label: "Size fit (revenue/headcount) vs ideal range", set: "fit5" },
-      { id: "service_mix_fit", label: "Service mix fits desired portfolio", set: "fit5" },
-      { id: "ownership_fit", label: "Ownership structure is workable (founder/ESOP/PE)", set: "fit5" },
-      { id: "client_concentration_risk", label: "Client concentration risk", set: "risk5" },
+    key: "q5",
+    dimension: "Risk",
+    title: "Customer concentration / churn risk",
+    prompt: "How risky is revenue concentration and retention?",
+    options: [
+      { label: "Low concentration + very sticky retention", score: 10 },
+      { label: "Manageable concentration + good retention", score: 8 },
+      { label: "Some concentration or churn concerns", score: 6 },
+      { label: "High concentration or churn risk", score: 3 },
+      { label: "Extreme concentration / unstable revenue", score: 0 },
     ],
   },
   {
-    id: "sell_readiness",
-    title: "Ownership & Sell-Readiness",
-    description: "Signals that a sale is plausible in the next 6–24 months.",
-    questions: [
-      { id: "succession_driver", label: "Succession gap / founder dependence drives openness", set: "readiness5" },
-      { id: "leadership_transition", label: "Leadership transition / succession planning underway", set: "readiness5" },
-      { id: "liquidity_pressure", label: "Liquidity need / ESOP pressure / recap drivers", set: "readiness5" },
-      { id: "signals_sale", label: "Direct/indirect signals of transaction appetite", set: "readiness5" },
+    key: "q6",
+    dimension: "Risk",
+    title: "Technical / security / compliance risk",
+    prompt: "How strong is engineering quality + security posture?",
+    options: [
+      { label: "Strong architecture + security best practices", score: 10 },
+      { label: "Generally solid with small gaps", score: 8 },
+      { label: "Mixed; needs medium remediation", score: 6 },
+      { label: "Meaningful risk; major remediation", score: 3 },
+      { label: "High risk / unknown / fragile", score: 0 },
     ],
   },
   {
-    id: "financial_quality",
-    title: "Financial Quality",
-    description: "Is the business healthy and likely to meet return hurdles?",
-    questions: [
-      { id: "growth_trend", label: "Revenue growth trend", set: "momentum5" },
-      { id: "profitability_quality", label: "Profitability & earnings quality (normalized)", set: "fit5" },
-      { id: "backlog_strength", label: "Backlog / pipeline strength", set: "momentum5" },
-      { id: "cyclicality_risk", label: "Cyclicality / sector exposure risk", set: "risk5" },
+    key: "q7",
+    dimension: "Readiness",
+    title: "Integration readiness",
+    prompt: "How easy will it be to integrate product + data + teams?",
+    options: [
+      { label: "Integration-ready (APIs, docs, clean data)", score: 10 },
+      { label: "Mostly ready; some work needed", score: 8 },
+      { label: "Moderate effort; systems need cleanup", score: 6 },
+      { label: "Hard integration; messy systems", score: 3 },
+      { label: "Very hard / no readiness", score: 0 },
     ],
   },
   {
-    id: "talent_delivery",
-    title: "Talent & Delivery Strength",
-    description: "Can delivery sustain post-close? Is key-person risk manageable?",
-    questions: [
-      { id: "bench_strength", label: "Depth beyond founder (leadership bench)", set: "fit5" },
-      { id: "key_person_risk", label: "Key-person dependence risk", set: "risk5" },
-      { id: "credential_strength", label: "Scarce credentials / niche expertise value", set: "fit5" },
-      { id: "attrition_risk", label: "Attrition risk post-close", set: "risk5" },
+    key: "q8",
+    dimension: "Readiness",
+    title: "Team & execution reliability",
+    prompt: "Can the team execute through transition and scale?",
+    options: [
+      { label: "Exceptional team (repeat winners)", score: 10 },
+      { label: "Strong team with good track record", score: 8 },
+      { label: "Solid but unproven in scale-up", score: 6 },
+      { label: "Execution risk / leadership gaps", score: 3 },
+      { label: "High risk / unstable team", score: 0 },
     ],
   },
   {
-    id: "culture_integration",
-    title: "Culture & Integration",
-    description: "Will integration work without breaking delivery or talent retention?",
-    questions: [
-      { id: "culture_fit", label: "Culture fit", set: "fit5" },
-      { id: "operating_model_fit", label: "Operating model compatibility", set: "fit5" },
-      { id: "tech_stack_fit", label: "Tech stack compatibility (BIM/CAD/ERP/CRM)", set: "fit5" },
-      { id: "integration_complexity", label: "Integration complexity risk", set: "risk5" },
-    ],
-  },
-  {
-    id: "competitive_dynamics",
-    title: "Competitive Dynamics",
-    description: "How contested is this target and what is our strategic positioning?",
-    questions: [
-      { id: "competitive_interest", label: "Likelihood of competing buyers", set: "risk5" },
-      { id: "best_home", label: "We are a compelling 'best home' vs alternatives", set: "fit5" },
-    ],
-  },
-  {
-    id: "deal_feasibility",
-    title: "Deal Feasibility",
-    description: "Is there a realistic approach path and deal structure?",
-    questions: [
-      { id: "intro_path", label: "Warm intro / approach path", set: "fit5" },
-      { id: "structure_flex", label: "Structure flexibility (earnout/rollover/partial)", set: "fit5" },
+    key: "q9",
+    dimension: "Fit",
+    title: "Value creation path (synergies)",
+    prompt: "How clear is the post-acquisition value creation plan?",
+    options: [
+      { label: "Obvious synergies + multiple value levers", score: 10 },
+      { label: "Clear path with 1–2 strong levers", score: 8 },
+      { label: "Some levers, not fully validated", score: 6 },
+      { label: "Weak synergy story", score: 3 },
+      { label: "No clear path", score: 0 },
     ],
   },
 ];
 
-// ---------- Helpers ----------
-function sectionScore(section, answers) {
-  let total = 0;
-  let count = 0;
+// Dimension weights -> normalized automatically
+const DIMENSION_WEIGHTS = {
+  Fit: 0.35,
+  Risk: 0.25,
+  Momentum: 0.20,
+  Readiness: 0.20,
+};
 
-  for (const q of section.questions) {
-    const set = OPTION_SETS[q.set];
-    const v = answers?.[q.id] ?? DEFAULT_ANSWER;
+// Tier thresholds (0-100)
+const TIERS = [
+  { key: "tier1", name: "Tier 1", min: 78 },
+  { key: "tier2", name: "Tier 2", min: 62 },
+  { key: "watch", name: "Watchlist", min: 0 },
+];
 
-    const option = set.options.find((o) => o.value === v) || set.options.find((o) => o.value === "unknown");
-    total += option ? option.score : 35;
-    count += 1;
+/* ----------------------------- Helpers ----------------------------- */
+const LS_KEY = "aec_screener_v1";
+
+function uid() {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+function safeNum(v) {
+  if (v === "" || v === null || v === undefined) return "";
+  const n = Number(v);
+  return Number.isFinite(n) ? n : "";
+}
+
+function formatRevenue(v) {
+  if (v === "" || v === null || v === undefined) return "";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return String(v);
+  // revenue in USD millions for simplicity
+  if (n >= 1000) return `$${(n / 1000).toFixed(2)}B`;
+  return `$${n.toFixed(0)}M`;
+}
+
+function clamp01(x) {
+  return Math.max(0, Math.min(1, x));
+}
+
+function computeScores(company) {
+  const answers = company.answers || {};
+  const dimToScores = {};
+  for (const d of DIMENSIONS) dimToScores[d] = [];
+
+  for (const q of QUESTIONS) {
+    const picked = answers[q.key];
+    const option = q.options.find((o) => o.label === picked);
+    const score = option ? option.score : null;
+    if (score !== null) dimToScores[q.dimension].push(score);
   }
 
-  return count ? total / count : 0;
-}
-
-function weightedTotalScore(company, weights) {
-  let sum = 0;
-  let weightSum = 0;
-
-  for (const section of SECTIONS) {
-    const w = weights[section.id] ?? 0;
-    const s = sectionScore(section, company.answers);
-    sum += (s * w) / 100;
-    weightSum += w;
+  // average per dimension (0..10)
+  const dimAvg10 = {};
+  for (const d of DIMENSIONS) {
+    const arr = dimToScores[d];
+    dimAvg10[d] = arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
   }
 
-  return weightSum ? sum / (weightSum / 100) : 0; // normalize 0..100
-}
+  // weighted -> 0..100
+  const weightSum = Object.values(DIMENSION_WEIGHTS).reduce((a, b) => a + b, 0);
+  let total01 = 0;
+  for (const d of DIMENSIONS) {
+    const w = (DIMENSION_WEIGHTS[d] || 0) / (weightSum || 1);
+    total01 += w * (dimAvg10[d] / 10);
+  }
+  const total100 = Math.round(clamp01(total01) * 100);
 
-function tierForScore(score, thresholds) {
-  if (score >= thresholds.tier1) return "Tier 1";
-  if (score >= thresholds.tier2) return "Tier 2";
-  return "Watchlist";
-}
-
-function useLocalStorageState(key, initialValue) {
-  const [state, setState] = useState(() => {
-    try {
-      const raw = localStorage.getItem(key);
-      return raw ? JSON.parse(raw) : initialValue;
-    } catch {
-      return initialValue;
+  let tier = "Watchlist";
+  for (const t of TIERS) {
+    if (total100 >= t.min) {
+      tier = t.name;
+      break;
     }
-  });
-
-  const setAndPersist = (updater) => {
-    setState((prev) => {
-      const next = typeof updater === "function" ? updater(prev) : updater;
-      try {
-        localStorage.setItem(key, JSON.stringify(next));
-      } catch {}
-      return next;
-    });
-  };
-
-  return [state, setAndPersist];
-}
-
-function makeDefaultAnswers() {
-  const entries = [];
-  for (const s of SECTIONS) {
-    for (const q of s.questions) {
-      entries.push([q.id, DEFAULT_ANSWER]);
-    }
   }
-  return Object.fromEntries(entries);
-}
 
-function starterCompany() {
-  return {
-    id: crypto.randomUUID(),
-    name: "",
-    website: "",
-    hqLocation: "",
-    revenue: "",
-    employees: "",
-    notes: "",
-    answers: makeDefaultAnswers(),
-  };
+  return { total100, tier, dimAvg10 };
 }
 
 function toCSV(rows) {
-  const esc = (v) => {
-    const s = String(v ?? "");
-    if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-    return s;
-  };
+  const esc = (s) => `"${String(s ?? "").replaceAll('"', '""')}"`;
   return rows.map((r) => r.map(esc).join(",")).join("\n");
 }
 
 function downloadText(filename, text) {
-  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const blob = new Blob([text], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
   a.download = filename;
+  document.body.appendChild(a);
   a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 500);
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
-function badgeStyle(tier) {
-  const base = {
-    display: "inline-block",
-    fontSize: 12,
-    padding: "4px 8px",
-    borderRadius: 999,
-    border: "1px solid #ddd",
-    background: "#fff",
-    whiteSpace: "nowrap",
-  };
-  if (tier === "Tier 1") return { ...base, borderColor: "#111", background: "#111", color: "#fff" };
-  if (tier === "Tier 2") return { ...base, borderColor: "#666", background: "#f2f2f2", color: "#111" };
-  return { ...base, borderColor: "#ddd", background: "#fff", color: "#111" };
-}
-
-function buildOptionsForSet(setKey) {
-  const set = OPTION_SETS[setKey];
-  return set ? set.options.map(({ value, label }) => ({ value, label })) : [];
-}
-
-// ---------- UI ----------
+/* ----------------------------- App ----------------------------- */
 export default function App() {
-  const [data, setData] = useLocalStorageState(STORAGE_KEY, {
-    companies: [],
-    weights: defaultWeights,
-    thresholds: defaultThresholds,
-  });
+  const [companies, setCompanies] = useState([]);
+  const [activeId, setActiveId] = useState(null);
 
-  const [activeCompanyId, setActiveCompanyId] = useState(
-    data.companies?.[0]?.id ?? null
-  );
+  // “Add company” inline fields
+  const [newName, setNewName] = useState("");
+  const [newRevenue, setNewRevenue] = useState("");
+  const [newEmployees, setNewEmployees] = useState("");
+  const [newHQ, setNewHQ] = useState("");
+
+  // persistence
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed.companies)) {
+          setCompanies(parsed.companies);
+          setActiveId(parsed.activeId ?? (parsed.companies[0]?.id || null));
+          return;
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    // default empty state
+    setCompanies([]);
+    setActiveId(null);
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify({ companies, activeId }));
+    } catch {
+      // ignore
+    }
+  }, [companies, activeId]);
 
   const activeCompany = useMemo(
-    () => data.companies.find((c) => c.id === activeCompanyId) ?? null,
-    [data.companies, activeCompanyId]
+    () => companies.find((c) => c.id === activeId) || null,
+    [companies, activeId]
   );
 
-  const computed = useMemo(() => {
-    const rows = data.companies.map((c) => {
-      const total = weightedTotalScore(c, data.weights);
-      const tier = tierForScore(total, data.thresholds);
-      const sections = Object.fromEntries(
-        SECTIONS.map((s) => [s.id, sectionScore(s, c.answers)])
-      );
-      return { ...c, total, tier, sections };
+  const scoredCompanies = useMemo(() => {
+    return companies.map((c) => {
+      const s = computeScores(c);
+      return { ...c, _score: s.total100, _tier: s.tier, _dims: s.dimAvg10 };
     });
+  }, [companies]);
 
-    const byTier = {
-      "Tier 1": rows.filter((r) => r.tier === "Tier 1").sort((a, b) => b.total - a.total),
-      "Tier 2": rows.filter((r) => r.tier === "Tier 2").sort((a, b) => b.total - a.total),
-      Watchlist: rows.filter((r) => r.tier === "Watchlist").sort((a, b) => b.total - a.total),
+  const tierBuckets = useMemo(() => {
+    const buckets = { "Tier 1": [], "Tier 2": [], Watchlist: [] };
+    for (const c of scoredCompanies) buckets[c._tier].push(c);
+    for (const k of Object.keys(buckets)) {
+      buckets[k].sort((a, b) => (b._score ?? 0) - (a._score ?? 0));
+    }
+    return buckets;
+  }, [scoredCompanies]);
+
+  function addCompany() {
+    const name = newName.trim();
+    if (!name) return;
+
+    const c = {
+      id: uid(),
+      name,
+      revenueM: safeNum(newRevenue) === "" ? "" : Number(newRevenue), // store as $M
+      employees: safeNum(newEmployees) === "" ? "" : Number(newEmployees),
+      hq: newHQ.trim(),
+      notes: "",
+      answers: {},
     };
 
-    return { rows, byTier };
-  }, [data.companies, data.weights, data.thresholds]);
+    setCompanies((prev) => [c, ...prev]);
+    setActiveId(c.id);
 
-  const weightTotal = useMemo(
-    () => Object.values(data.weights).reduce((a, b) => a + b, 0),
-    [data.weights]
-  );
+    setNewName("");
+    setNewRevenue("");
+    setNewEmployees("");
+    setNewHQ("");
+  }
 
-  const addCompany = () => {
-    const c = starterCompany();
-    setData((prev) => ({ ...prev, companies: [c, ...prev.companies] }));
-    setActiveCompanyId(c.id);
-  };
-
-  const updateCompany = (id, patch) => {
-    setData((prev) => ({
-      ...prev,
-      companies: prev.companies.map((c) => (c.id === id ? { ...c, ...patch } : c)),
-    }));
-  };
-
-  const updateAnswer = (companyId, qid, value) => {
-    setData((prev) => ({
-      ...prev,
-      companies: prev.companies.map((c) =>
-        c.id === companyId ? { ...c, answers: { ...c.answers, [qid]: value } } : c
-      ),
-    }));
-  };
-
-  const deleteCompany = (id) => {
-    setData((prev) => ({ ...prev, companies: prev.companies.filter((c) => c.id !== id) }));
-    if (activeCompanyId === id) {
-      const next = data.companies.find((c) => c.id !== id)?.id ?? null;
-      setActiveCompanyId(next);
+  function removeCompany(id) {
+    setCompanies((prev) => prev.filter((c) => c.id !== id));
+    if (activeId === id) {
+      const remaining = companies.filter((c) => c.id !== id);
+      setActiveId(remaining[0]?.id || null);
     }
-  };
+  }
 
-  const exportCSV = () => {
+  function updateActive(patch) {
+    if (!activeCompany) return;
+    setCompanies((prev) =>
+      prev.map((c) => (c.id === activeCompany.id ? { ...c, ...patch } : c))
+    );
+  }
+
+  function setAnswer(qKey, optionLabel) {
+    if (!activeCompany) return;
+    const nextAnswers = { ...(activeCompany.answers || {}) };
+    nextAnswers[qKey] = optionLabel;
+    updateActive({ answers: nextAnswers });
+  }
+
+  function resetAll() {
+    if (!confirm("Reset everything? This clears all companies + scores.")) return;
+    setCompanies([]);
+    setActiveId(null);
+    localStorage.removeItem(LS_KEY);
+  }
+
+  function exportCSV() {
     const header = [
-      "Tier",
-      "Total Score",
       "Company",
-      "Website",
-      "HQ Location",
-      "Revenue",
+      "Revenue ($M)",
       "Employees",
-      ...SECTIONS.map((s) => `${s.title} (0-100)`),
-      "Notes",
+      "HQ",
+      "Tier",
+      "Total Score (0-100)",
+      "Fit (0-10)",
+      "Risk (0-10)",
+      "Momentum (0-10)",
+      "Readiness (0-10)",
+      ...QUESTIONS.map((q) => q.title),
     ];
 
-    const rows = computed.rows
-      .slice()
-      .sort((a, b) => {
-        const order = { "Tier 1": 0, "Tier 2": 1, Watchlist: 2 };
-        return order[a.tier] - order[b.tier] || b.total - a.total;
-      })
-      .map((r) => [
-        r.tier,
-        r.total.toFixed(1),
-        r.name,
-        r.website,
-        r.hqLocation,
-        r.revenue,
-        r.employees,
-        ...SECTIONS.map((s) => (r.sections?.[s.id] ?? 0).toFixed(1)),
-        r.notes,
-      ]);
+    const rows = scoredCompanies.map((c) => [
+      c.name,
+      c.revenueM === "" ? "" : c.revenueM,
+      c.employees === "" ? "" : c.employees,
+      c.hq || "",
+      c._tier || "",
+      c._score ?? "",
+      (c._dims?.Fit ?? 0).toFixed(1),
+      (c._dims?.Risk ?? 0).toFixed(1),
+      (c._dims?.Momentum ?? 0).toFixed(1),
+      (c._dims?.Readiness ?? 0).toFixed(1),
+      ...QUESTIONS.map((q) => (c.answers || {})[q.key] || ""),
+    ]);
 
-    downloadText(`aec-targets_${new Date().toISOString().slice(0, 10)}.csv`, toCSV([header, ...rows]));
-  };
+    downloadText("aec_screener.csv", toCSV([header, ...rows]));
+  }
 
-  const resetAll = () => {
-    setData({ companies: [], weights: defaultWeights, thresholds: defaultThresholds });
-    setActiveCompanyId(null);
-  };
-
-  const activeTotal = activeCompany ? weightedTotalScore(activeCompany, data.weights) : 0;
-  const activeTier = activeCompany ? tierForScore(activeTotal, data.thresholds) : "Watchlist";
+  const activeScore = useMemo(() => {
+    if (!activeCompany) return null;
+    return computeScores(activeCompany);
+  }, [activeCompany]);
 
   return (
-    <div style={styles.page}>
-      <div style={styles.container}>
-        <div style={styles.headerRow}>
+    <AuthGate>
+      <div style={styles.page}>
+        <div style={styles.header}>
           <div>
-            <h1 style={styles.h1}>AEC Acquisition Target Screener</h1>
+            <div style={styles.h1}>AEC Acquisition Target Screener</div>
             <div style={styles.sub}>
               Granular scoring across all questions (Fit / Risk / Momentum / Readiness). Saved in this browser.
             </div>
           </div>
 
-          <div style={styles.headerButtons}>
-            <button style={styles.primaryBtn} onClick={addCompany}>+ Add company</button>
-            <button style={styles.btn} onClick={exportCSV} disabled={data.companies.length === 0}>
+          <div style={styles.headerBtns}>
+            <button style={styles.primaryBtn} onClick={addCompany} title="Add company using fields below">
+              + Add company
+            </button>
+            <button style={styles.ghostBtn} onClick={exportCSV} disabled={!companies.length}>
               Export CSV
             </button>
-            <button style={styles.ghostBtn} onClick={resetAll}>
+            <button style={styles.dangerBtn} onClick={resetAll}>
               Reset
             </button>
           </div>
         </div>
 
-        <div style={styles.smallNote}>
-          Weights total: <b>{weightTotal}%</b> (scores normalized automatically)
-        </div>
-
-        <div style={styles.grid}>
-          {/* Left: Companies */}
+        <div style={styles.grid3}>
+          {/* LEFT: Companies */}
           <div style={styles.card}>
             <div style={styles.cardTitle}>Companies</div>
-            {computed.rows.length === 0 ? (
-              <div style={styles.muted}>No companies yet. Click “Add company”.</div>
-            ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {computed.rows
-                  .slice()
-                  .sort((a, b) => b.total - a.total)
-                  .map((c) => (
-                    <button
-                      key={c.id}
-                      onClick={() => setActiveCompanyId(c.id)}
-                      style={{
-                        ...styles.companyRow,
-                        borderColor: c.id === activeCompanyId ? "#333" : "#ddd",
-                        background: c.id === activeCompanyId ? "#f7f7f7" : "white",
-                      }}
-                    >
-                      <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                        <div style={{ minWidth: 0 }}>
-                          <div style={styles.companyName}>
-                            {c.name?.trim() ? c.name : "(Unnamed company)"}
-                          </div>
 
-                          <div style={styles.smallMuted}>
-                            Score <b>{c.total.toFixed(1)}</b> • {c.hqLocation || "HQ unknown"} • {c.tier}
-                          </div>
-
-                          <div style={styles.smallMuted}>
-                            {c.revenue ? `Rev: ${c.revenue}` : "Rev: —"}
-                            {" • "}
-                            {c.employees ? `Emp: ${c.employees}` : "Emp: —"}
-                          </div>
-                        </div>
-
-                        <div style={badgeStyle(c.tier)}>{c.tier}</div>
-                      </div>
-                    </button>
-                  ))}
+            <div style={styles.addBox}>
+              <div style={styles.formGrid2}>
+                <div>
+                  <div style={styles.label}>Company name</div>
+                  <input
+                    style={styles.input}
+                    value={newName}
+                    onChange={(e) => setNewName(e.target.value)}
+                    placeholder="e.g., BuildFlow"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") addCompany();
+                    }}
+                  />
+                </div>
+                <div>
+                  <div style={styles.label}>Revenue ($M)</div>
+                  <input
+                    style={styles.input}
+                    value={newRevenue}
+                    onChange={(e) => setNewRevenue(e.target.value)}
+                    placeholder="e.g., 35"
+                    inputMode="numeric"
+                  />
+                </div>
+                <div>
+                  <div style={styles.label}># Employees</div>
+                  <input
+                    style={styles.input}
+                    value={newEmployees}
+                    onChange={(e) => setNewEmployees(e.target.value)}
+                    placeholder="e.g., 120"
+                    inputMode="numeric"
+                  />
+                </div>
+                <div>
+                  <div style={styles.label}>HQ location</div>
+                  <input
+                    style={styles.input}
+                    value={newHQ}
+                    onChange={(e) => setNewHQ(e.target.value)}
+                    placeholder="e.g., Austin, TX"
+                  />
+                </div>
               </div>
-            )}
+              <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
+                <button style={styles.primaryBtn} onClick={addCompany}>
+                  Add
+                </button>
+                <div style={styles.muted}>
+                  Tip: Revenue stored as <b>$M</b> (e.g., “35” = $35M).
+                </div>
+              </div>
+            </div>
+
+            <div style={styles.list}>
+              {!scoredCompanies.length ? (
+                <div style={styles.muted}>No companies yet. Use “Add company”.</div>
+              ) : (
+                scoredCompanies.map((c) => (
+                  <div
+                    key={c.id}
+                    style={{
+                      ...styles.companyRow,
+                      ...(c.id === activeId ? styles.companyRowActive : {}),
+                    }}
+                    onClick={() => setActiveId(c.id)}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                      <div style={styles.companyName}>{c.name}</div>
+                      <div style={styles.scorePill}>{c._score ?? 0}</div>
+                    </div>
+
+                    <div style={styles.companyMeta}>
+                      <span style={styles.metaChip}>{c._tier}</span>
+                      <span style={styles.metaChip}>
+                        Rev: {c.revenueM === "" ? "—" : formatRevenue(c.revenueM)}
+                      </span>
+                      <span style={styles.metaChip}>
+                        Emp: {c.employees === "" ? "—" : c.employees}
+                      </span>
+                    </div>
+
+                    <div style={styles.companyMeta2}>
+                      <span style={styles.mutedSmall}>HQ: {c.hq || "—"}</span>
+                      <button
+                        style={styles.tinyDanger}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          removeCompany(c.id);
+                        }}
+                        title="Remove"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
           </div>
 
-          {/* Middle: Scoring */}
+          {/* MIDDLE: Score a company */}
           <div style={styles.card}>
             {!activeCompany ? (
               <div style={styles.muted}>Select or add a company to score.</div>
             ) : (
-              <div>
-                <div style={styles.cardTitle}>Score a company</div>
+              <>
+                <div style={styles.sectionHeader}>
+                  <div>
+                    <div style={styles.cardTitle}>Score a company</div>
+                    <div style={styles.mutedSmall}>
+                      {activeCompany.name} • Total:{" "}
+                      <b>{activeScore?.total100 ?? 0}</b> • {activeScore?.tier}
+                    </div>
+                  </div>
+                </div>
 
                 <div style={styles.formGrid3}>
                   <div>
-                    <div style={styles.label}>Company name</div>
+                    <div style={styles.label}>Revenue ($M)</div>
                     <input
                       style={styles.input}
-                      value={activeCompany.name}
-                      onChange={(e) => updateCompany(activeCompany.id, { name: e.target.value })}
-                      placeholder="e.g., ABC Structural Engineers"
+                      value={activeCompany.revenueM === "" ? "" : String(activeCompany.revenueM)}
+                      onChange={(e) => updateActive({ revenueM: safeNum(e.target.value) === "" ? "" : Number(e.target.value) })}
+                      placeholder="e.g., 35"
+                      inputMode="numeric"
                     />
                   </div>
-
                   <div>
-                    <div style={styles.label}>Website</div>
+                    <div style={styles.label}># Employees</div>
                     <input
                       style={styles.input}
-                      value={activeCompany.website}
-                      onChange={(e) => updateCompany(activeCompany.id, { website: e.target.value })}
-                      placeholder="https://..."
+                      value={activeCompany.employees === "" ? "" : String(activeCompany.employees)}
+                      onChange={(e) => updateActive({ employees: safeNum(e.target.value) === "" ? "" : Number(e.target.value) })}
+                      placeholder="e.g., 120"
+                      inputMode="numeric"
                     />
                   </div>
-
                   <div>
                     <div style={styles.label}>HQ location</div>
                     <input
                       style={styles.input}
-                      value={activeCompany.hqLocation}
-                      onChange={(e) => updateCompany(activeCompany.id, { hqLocation: e.target.value })}
-                      placeholder="e.g., Denver, CO"
+                      value={activeCompany.hq || ""}
+                      onChange={(e) => updateActive({ hq: e.target.value })}
+                      placeholder="e.g., Austin, TX"
                     />
                   </div>
+                </div>
 
-                  <div>
-                    <div style={styles.label}>Revenue (optional)</div>
-                    <input
-                      style={styles.input}
-                      value={activeCompany.revenue}
-                      onChange={(e) => updateCompany(activeCompany.id, { revenue: e.target.value })}
-                      placeholder="e.g., $25M"
-                    />
+                <div style={styles.thresholdBox}>
+                  <div style={styles.sectionTitle}>Dimension breakdown</div>
+                  <div style={styles.dimRow}>
+                    {DIMENSIONS.map((d) => (
+                      <div key={d} style={styles.dimCard}>
+                        <div style={styles.dimLabel}>{d}</div>
+                        <div style={styles.dimValue}>
+                          {(activeScore?.dimAvg10?.[d] ?? 0).toFixed(1)} / 10
+                        </div>
+                        <div style={styles.mutedSmall}>
+                          Weight: {(DIMENSION_WEIGHTS[d] * 100).toFixed(0)}%
+                        </div>
+                      </div>
+                    ))}
                   </div>
+                </div>
 
-                  <div>
-                    <div style={styles.label}>Employees (optional)</div>
-                    <input
-                      style={styles.input}
-                      value={activeCompany.employees}
-                      onChange={(e) => updateCompany(activeCompany.id, { employees: e.target.value })}
-                      placeholder="e.g., 120"
-                    />
-                  </div>
+                <div style={{ marginTop: 12 }}>
+                  {QUESTIONS.map((q) => {
+                    const chosen = (activeCompany.answers || {})[q.key] || "";
+                    const chosenObj = q.options.find((o) => o.label === chosen);
+                    return (
+                      <div key={q.key} style={styles.qCard}>
+                        <div style={styles.qTop}>
+                          <div>
+                            <div style={styles.qTitle}>
+                              {q.title}{" "}
+                              <span style={styles.qDimPill}>{q.dimension}</span>
+                            </div>
+                            <div style={styles.mutedSmall}>{q.prompt}</div>
+                          </div>
+                          <div style={styles.qScore}>
+                            {chosenObj ? `${chosenObj.score}/10` : "—"}
+                          </div>
+                        </div>
 
-                  <div style={{ display: "flex", alignItems: "end", justifyContent: "space-between", gap: 10 }}>
-                    <div style={styles.smallMuted}>
-                      Total: <b>{activeTotal.toFixed(1)}</b> •{" "}
-                      <span style={badgeStyle(activeTier)}>{activeTier}</span>
-                    </div>
-                    <button style={styles.dangerBtn} onClick={() => deleteCompany(activeCompany.id)}>
-                      Delete
-                    </button>
-                  </div>
+                        <select
+                          style={styles.select}
+                          value={chosen}
+                          onChange={(e) => setAnswer(q.key, e.target.value)}
+                        >
+                          <option value="">Select response…</option>
+                          {q.options.map((o) => (
+                            <option key={o.label} value={o.label}>
+                              {o.label} ({o.score}/10)
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    );
+                  })}
                 </div>
 
                 <div style={{ marginTop: 12 }}>
                   <div style={styles.label}>Notes</div>
                   <textarea
                     style={styles.textarea}
-                    value={activeCompany.notes}
-                    onChange={(e) => updateCompany(activeCompany.id, { notes: e.target.value })}
-                    placeholder="Key takeaways, diligence questions, contact path, etc."
+                    value={activeCompany.notes || ""}
+                    onChange={(e) => updateActive({ notes: e.target.value })}
+                    placeholder="Diligence notes, links, concerns, catalysts…"
                   />
                 </div>
-
-                <hr style={{ margin: "16px 0" }} />
-
-                {SECTIONS.map((section) => {
-                  const secScore = sectionScore(section, activeCompany.answers);
-                  const weight = data.weights[section.id] ?? 0;
-
-                  return (
-                    <div key={section.id} style={{ marginBottom: 18 }}>
-                      <div style={styles.sectionHeader}>
-                        <div style={{ minWidth: 0 }}>
-                          <div style={styles.sectionTitle}>{section.title}</div>
-                          <div style={styles.smallMuted}>{section.description}</div>
-                        </div>
-                        <div style={{ textAlign: "right" }}>
-                          <div style={{ fontWeight: 800 }}>{secScore.toFixed(1)}</div>
-                          <div style={styles.smallMuted}>Weight {weight}%</div>
-                        </div>
-                      </div>
-
-                      <div style={styles.qGrid}>
-                        {section.questions.map((q) => {
-                          const v = activeCompany.answers?.[q.id] ?? DEFAULT_ANSWER;
-                          const setLabel = OPTION_SETS[q.set]?.label ?? "Set";
-
-                          return (
-                            <div key={q.id} style={styles.qCard}>
-                              <div style={{ fontWeight: 800, marginBottom: 6 }}>{q.label}</div>
-                              <div style={styles.microMuted}>Response type: {setLabel}</div>
-
-                              <select
-                                style={{ ...styles.input, marginTop: 8 }}
-                                value={v}
-                                onChange={(e) => updateAnswer(activeCompany.id, q.id, e.target.value)}
-                              >
-                                {buildOptionsForSet(q.set).map((opt) => (
-                                  <option key={opt.value} value={opt.value}>
-                                    {opt.label}
-                                  </option>
-                                ))}
-                              </select>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
+              </>
             )}
           </div>
 
-          {/* Right: Tier lists */}
+          {/* RIGHT: Tier Lists */}
           <div style={styles.card}>
             <div style={styles.cardTitle}>Tier Lists</div>
 
-            <div style={styles.thresholdBox}>
-              <div style={styles.smallMuted}>
-                Tier 1 ≥ <b>{data.thresholds.tier1}</b>
-                <br />
-                Tier 2 ≥ <b>{data.thresholds.tier2}</b>
+            <div style={styles.tierSummary}>
+              <div style={styles.tierSummaryRow}>
+                <span style={styles.mutedSmall}>Tier 1 ≥ {TIERS[0].min}</span>
+                <b>{tierBuckets["Tier 1"].length}</b>
+              </div>
+              <div style={styles.tierSummaryRow}>
+                <span style={styles.mutedSmall}>Tier 2 ≥ {TIERS[1].min}</span>
+                <b>{tierBuckets["Tier 2"].length}</b>
+              </div>
+              <div style={styles.tierSummaryRow}>
+                <span style={styles.mutedSmall}>Watchlist</span>
+                <b>{tierBuckets["Watchlist"].length}</b>
               </div>
             </div>
 
-            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              <TierColumn title="Tier 1" rows={computed.byTier["Tier 1"]} />
-              <TierColumn title="Tier 2" rows={computed.byTier["Tier 2"]} />
-              <TierColumn title="Watchlist" rows={computed.byTier["Watchlist"]} />
-            </div>
+            {["Tier 1", "Tier 2", "Watchlist"].map((tierName) => (
+              <div key={tierName} style={styles.tierBlock}>
+                <div style={styles.tierHeader}>
+                  <div style={styles.sectionTitle}>{tierName}</div>
+                  <div style={styles.mutedSmall}>{tierBuckets[tierName].length}</div>
+                </div>
 
-            <hr style={{ margin: "14px 0" }} />
-
-            <div style={styles.cardTitle}>Full Matrix (quick)</div>
-            {computed.rows.length === 0 ? (
-              <div style={styles.smallMuted}>Add companies to see the matrix.</div>
-            ) : (
-              <div style={styles.miniTableWrap}>
-                <table style={styles.miniTable}>
-                  <thead>
-                    <tr>
-                      <th style={styles.th}>Tier</th>
-                      <th style={styles.th}>Company</th>
-                      <th style={styles.th}>Score</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {computed.rows
-                      .slice()
-                      .sort((a, b) => {
-                        const order = { "Tier 1": 0, "Tier 2": 1, Watchlist: 2 };
-                        return order[a.tier] - order[b.tier] || b.total - a.total;
-                      })
-                      .map((r) => (
-                        <tr key={r.id}>
-                          <td style={styles.td}>
-                            <span style={badgeStyle(r.tier)}>{r.tier}</span>
-                          </td>
-                          <td style={styles.td}>
-                            <span style={{ fontWeight: 800 }}>
-                              {r.name?.trim() ? r.name : "(Unnamed)"}
-                            </span>
-                            <div style={styles.smallMuted}>{r.hqLocation || "—"}</div>
-                            <div style={styles.smallMuted}>
-                              {r.revenue ? `Rev: ${r.revenue}` : "Rev: —"}{" • "}
-                              {r.employees ? `Emp: ${r.employees}` : "Emp: —"}
-                            </div>
-                          </td>
-                          <td style={styles.td}><b>{r.total.toFixed(1)}</b></td>
-                        </tr>
-                      ))}
-                  </tbody>
-                </table>
+                {tierBuckets[tierName].length ? (
+                  <div style={styles.tierList}>
+                    {tierBuckets[tierName].map((c) => (
+                      <div
+                        key={c.id}
+                        style={styles.tierRow}
+                        onClick={() => setActiveId(c.id)}
+                        title="Click to open"
+                      >
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                          <div style={{ fontWeight: 800 }}>{c.name}</div>
+                          <div style={styles.scorePillSmall}>{c._score}</div>
+                        </div>
+                        <div style={styles.mutedSmall}>
+                          Rev: {c.revenueM === "" ? "—" : formatRevenue(c.revenueM)} • Emp:{" "}
+                          {c.employees === "" ? "—" : c.employees} • HQ: {c.hq || "—"}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div style={styles.mutedSmall}>None yet.</div>
+                )}
               </div>
-            )}
+            ))}
+
+            <div style={{ marginTop: 12 }}>
+              <div style={styles.sectionTitle}>Full Matrix (quick)</div>
+              {!scoredCompanies.length ? (
+                <div style={styles.mutedSmall}>Add companies to see the matrix.</div>
+              ) : (
+                <div style={styles.miniTableWrap}>
+                  <table style={styles.miniTable}>
+                    <thead>
+                      <tr>
+                        <th style={styles.th}>Company</th>
+                        <th style={styles.th}>Tier</th>
+                        <th style={styles.th}>Score</th>
+                        <th style={styles.th}>Rev</th>
+                        <th style={styles.th}>Emp</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {scoredCompanies
+                        .slice()
+                        .sort((a, b) => (b._score ?? 0) - (a._score ?? 0))
+                        .map((c) => (
+                          <tr
+                            key={c.id}
+                            style={styles.tr}
+                            onClick={() => setActiveId(c.id)}
+                            title="Click to open"
+                          >
+                            <td style={styles.td}>{c.name}</td>
+                            <td style={styles.td}>{c._tier}</td>
+                            <td style={styles.td}>
+                              <b>{c._score}</b>
+                            </td>
+                            <td style={styles.td}>
+                              {c.revenueM === "" ? "—" : formatRevenue(c.revenueM)}
+                            </td>
+                            <td style={styles.td}>{c.employees === "" ? "—" : c.employees}</td>
+                          </tr>
+                        ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
           </div>
         </div>
-      </div>
-    </div>
-  );
-}
 
-function TierColumn({ title, rows }) {
-  return (
-    <div style={styles.tierCol}>
-      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline" }}>
-        <div style={{ fontWeight: 900 }}>{title}</div>
-        <div style={styles.smallMuted}>{rows.length}</div>
-      </div>
-
-      {rows.length === 0 ? (
-        <div style={styles.smallMuted}>None yet.</div>
-      ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
-          {rows.map((r) => (
-            <div key={r.id} style={styles.tierRow}>
-              <div style={{ fontWeight: 900 }}>{r.name?.trim() ? r.name : "(Unnamed)"}</div>
-              <div style={styles.smallMuted}>
-                Score <b>{r.total.toFixed(1)}</b> • {r.hqLocation || "—"}
-              </div>
-              <div style={styles.smallMuted}>
-                {r.revenue ? `Rev: ${r.revenue}` : "Rev: —"}{" • "}
-                {r.employees ? `Emp: ${r.employees}` : "Emp: —"}
-              </div>
-            </div>
-          ))}
+        <div style={styles.footerNote}>
+          Tip: If you’re deploying under <b>/aecproject</b>, keep your app routing “relative” (this file does not assume any React Router).
         </div>
-      )}
-    </div>
+      </div>
+    </AuthGate>
   );
 }
 
-// ---------- Styles ----------
+/* ----------------------------- Styles ----------------------------- */
 const styles = {
   page: {
-    fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
-    background: "#fafafa",
     minHeight: "100vh",
+    padding: 18,
+    background: "#fafafa",
+    fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif",
+    color: "#111",
   },
-  container: { maxWidth: 1400, margin: "0 auto", padding: 20 },
 
-  headerRow: {
+  header: {
     display: "flex",
     justifyContent: "space-between",
-    alignItems: "flex-end",
-    gap: 16,
-    flexWrap: "wrap",
+    gap: 12,
+    alignItems: "flex-start",
+    marginBottom: 14,
   },
-  h1: { margin: 0, fontSize: 26 },
-  sub: { color: "#555", marginTop: 6, maxWidth: 950 },
-  headerButtons: { display: "flex", gap: 10, flexWrap: "wrap" },
+  h1: { fontSize: 26, fontWeight: 900, letterSpacing: -0.3 },
+  sub: { color: "#666", marginTop: 4, fontSize: 13 },
 
-  btn: {
-    padding: "10px 12px",
-    borderRadius: 10,
-    border: "1px solid #ccc",
-    background: "white",
-    cursor: "pointer",
-  },
-  ghostBtn: {
-    padding: "10px 12px",
-    borderRadius: 10,
-    border: "1px solid #eee",
-    background: "#f6f6f6",
-    cursor: "pointer",
-  },
-  primaryBtn: {
-    padding: "10px 12px",
-    borderRadius: 10,
-    border: "1px solid #333",
-    background: "#111",
-    color: "white",
-    cursor: "pointer",
-  },
-  dangerBtn: {
-    padding: "10px 12px",
-    borderRadius: 10,
-    border: "1px solid #b00",
-    background: "#b00",
-    color: "white",
-    cursor: "pointer",
-  },
+  headerBtns: { display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" },
 
-  smallNote: { marginTop: 10, color: "#666", fontSize: 12 },
-  smallMuted: { color: "#666", fontSize: 12, marginTop: 4 },
-  microMuted: { color: "#777", fontSize: 11 },
-
-  grid: {
+  grid3: {
     display: "grid",
-    gridTemplateColumns: "320px 1fr 380px",
-    gap: 14,
-    marginTop: 14,
+    gridTemplateColumns: "1.1fr 1.8fr 1.1fr",
+    gap: 12,
     alignItems: "start",
   },
 
-  card: { background: "white", border: "1px solid #e5e5e5", borderRadius: 14, padding: 14 },
-  cardTitle: { fontWeight: 900, marginBottom: 10 },
+  card: {
+    border: "1px solid #eee",
+    borderRadius: 16,
+    padding: 14,
+    background: "white",
+    boxShadow: "0 1px 0 rgba(0,0,0,0.02)",
+  },
+  cardTitle: { fontSize: 16, fontWeight: 900, marginBottom: 8 },
+  muted: { color: "#666", fontSize: 13 },
+  mutedSmall: { color: "#666", fontSize: 12 },
 
-  muted: { color: "#666", padding: 10, background: "#f5f5f5", borderRadius: 12 },
+  addBox: {
+    border: "1px solid #eee",
+    borderRadius: 14,
+    padding: 12,
+    background: "#fff",
+    marginBottom: 10,
+  },
 
-  companyRow: {
-    textAlign: "left",
+  formGrid2: {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr",
+    gap: 10,
+  },
+  formGrid3: {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr 1fr",
+    gap: 10,
+    marginBottom: 10,
+  },
+
+  label: { fontSize: 12, color: "#444", marginBottom: 6, fontWeight: 800 },
+  input: {
     width: "100%",
-    borderRadius: 12,
-    border: "1px solid #ddd",
     padding: 10,
+    borderRadius: 10,
+    border: "1px solid #ccc",
+    outline: "none",
+  },
+  select: {
+    width: "100%",
+    padding: 10,
+    borderRadius: 10,
+    border: "1px solid #ccc",
+    outline: "none",
+    background: "white",
+  },
+  textarea: {
+    width: "100%",
+    padding: 10,
+    borderRadius: 12,
+    border: "1px solid #ccc",
+    outline: "none",
+    minHeight: 110,
+    resize: "vertical",
+  },
+
+  primaryBtn: {
+    padding: "10px 12px",
+    borderRadius: 12,
+    border: 0,
+    background: "black",
+    color: "white",
+    fontWeight: 900,
+    cursor: "pointer",
+    whiteSpace: "nowrap",
+  },
+  ghostBtn: {
+    padding: "10px 12px",
+    borderRadius: 12,
+    border: "1px solid #eee",
     background: "white",
     cursor: "pointer",
+    fontWeight: 800,
+    whiteSpace: "nowrap",
+  },
+  dangerBtn: {
+    padding: "10px 12px",
+    borderRadius: 12,
+    border: "1px solid #ffe0e0",
+    background: "#fff5f5",
+    cursor: "pointer",
+    fontWeight: 900,
+    color: "#b00020",
+    whiteSpace: "nowrap",
+  },
+
+  list: { display: "grid", gap: 10, marginTop: 10 },
+
+  companyRow: {
+    border: "1px solid #eee",
+    borderRadius: 14,
+    padding: 12,
+    background: "#fff",
+    cursor: "pointer",
+  },
+  companyRowActive: {
+    border: "1px solid #ddd",
+    boxShadow: "0 0 0 2px rgba(0,0,0,0.04)",
   },
   companyName: {
-    fontWeight: 800,
+    fontWeight: 900,
     overflow: "hidden",
     textOverflow: "ellipsis",
     whiteSpace: "nowrap",
   },
+  scorePill: {
+    border: "1px solid #eee",
+    borderRadius: 999,
+    padding: "4px 10px",
+    fontWeight: 900,
+    background: "#fafafa",
+  },
+  scorePillSmall: {
+    border: "1px solid #eee",
+    borderRadius: 999,
+    padding: "2px 8px",
+    fontWeight: 900,
+    background: "#fafafa",
+    fontSize: 12,
+  },
 
-  formGrid3: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginTop: 10 },
-
-  label: { fontSize: 12, color: "#444", marginBottom: 6, fontWeight: 800 },
-  input: { width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ccc" },
-  textarea: { width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ccc", minHeight: 80 },
+  companyMeta: { display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 },
+  metaChip: {
+    fontSize: 12,
+    padding: "3px 8px",
+    borderRadius: 999,
+    border: "1px solid #eee",
+    background: "#fafafa",
+  },
+  companyMeta2: {
+    marginTop: 8,
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 10,
+  },
+  tinyDanger: {
+    border: "1px solid #ffe0e0",
+    background: "#fff5f5",
+    color: "#b00020",
+    borderRadius: 999,
+    padding: "4px 8px",
+    fontSize: 12,
+    cursor: "pointer",
+    fontWeight: 900,
+  },
 
   sectionHeader: {
     display: "flex",
     justifyContent: "space-between",
     alignItems: "flex-start",
     gap: 10,
-    marginTop: 12,
+    marginBottom: 8,
   },
-  sectionTitle: { fontWeight: 900 },
-
-  qGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 10 },
-  qCard: { border: "1px solid #eee", borderRadius: 12, padding: 10, background: "#fff" },
-
-  tierCol: { border: "1px solid #eee", borderRadius: 12, padding: 10, background: "#fff" },
-  tierRow: { border: "1px solid #f0f0f0", borderRadius: 10, padding: 8, background: "#fafafa" },
 
   thresholdBox: {
     border: "1px solid #eee",
+    borderRadius: 14,
+    padding: 12,
+    background: "#fafafa",
+    marginTop: 10,
+  },
+
+  sectionTitle: { fontWeight: 900, marginBottom: 8 },
+
+  dimRow: {
+    display: "grid",
+    gridTemplateColumns: "repeat(4, 1fr)",
+    gap: 10,
+  },
+  dimCard: {
+    border: "1px solid #eee",
+    borderRadius: 14,
+    padding: 10,
+    background: "white",
+  },
+  dimLabel: { fontSize: 12, color: "#666", fontWeight: 900 },
+  dimValue: { fontSize: 18, fontWeight: 900, marginTop: 4 },
+
+  qCard: {
+    border: "1px solid #eee",
+    borderRadius: 14,
+    padding: 12,
+    background: "white",
+    marginBottom: 10,
+  },
+  qTop: { display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 10 },
+  qTitle: { fontWeight: 900 },
+  qDimPill: {
+    fontSize: 11,
+    padding: "2px 8px",
+    borderRadius: 999,
+    border: "1px solid #eee",
+    background: "#fafafa",
+    marginLeft: 6,
+    fontWeight: 900,
+    color: "#444",
+  },
+  qScore: {
+    fontWeight: 900,
+    border: "1px solid #eee",
     borderRadius: 12,
+    padding: "6px 10px",
+    background: "#fafafa",
+    height: "fit-content",
+  },
+
+  tierSummary: {
+    border: "1px solid #eee",
+    borderRadius: 14,
     padding: 10,
     background: "#fafafa",
-    marginBottom: 12,
+    marginBottom: 10,
+  },
+  tierSummaryRow: { display: "flex", justifyContent: "space-between", marginTop: 4 },
+
+  tierBlock: {
+    borderTop: "1px solid #f2f2f2",
+    paddingTop: 10,
+    marginTop: 10,
+  },
+  tierHeader: { display: "flex", justifyContent: "space-between", alignItems: "center" },
+  tierList: { display: "grid", gap: 8, marginTop: 8 },
+  tierRow: {
+    border: "1px solid #eee",
+    borderRadius: 14,
+    padding: 10,
+    background: "white",
+    cursor: "pointer",
   },
 
   miniTableWrap: {
     border: "1px solid #eee",
-    borderRadius: 12,
+    borderRadius: 14,
     overflow: "auto",
     maxHeight: 360,
+    background: "white",
   },
   miniTable: { width: "100%", borderCollapse: "collapse", fontSize: 12 },
   th: {
@@ -832,6 +1125,19 @@ const styles = {
     background: "#fafafa",
     position: "sticky",
     top: 0,
+    zIndex: 1,
   },
   td: { padding: 10, borderBottom: "1px solid #f2f2f2", verticalAlign: "top" },
+  tr: { cursor: "pointer" },
+
+  footerNote: { marginTop: 12, color: "#777", fontSize: 12 },
+
+  // Auth styles
+  authWrap: { minHeight: "100vh", display: "grid", placeItems: "center", padding: 24, background: "#fafafa" },
+  authCard: { width: "min(420px, 100%)", border: "1px solid #eee", borderRadius: 16, padding: 18, background: "white" },
+  authTitle: { fontSize: 20, fontWeight: 900, marginBottom: 8 },
+  authSub: { color: "#666", marginBottom: 14 },
+  err: { color: "#b00020", fontSize: 13 },
+
+  logoutWrap: { position: "fixed", top: 10, right: 10, zIndex: 9999 },
 };

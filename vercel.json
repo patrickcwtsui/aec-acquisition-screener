@@ -1,8 +1,11 @@
 {
-  "rewrites": [
-    {
-      "source": "/aecproject/:path*",
-      "destination": "/:path*"
-    }
+  "routes": [
+    { "src": "^/api/(.*)$", "dest": "/api/$1" },
+
+    { "src": "^/$", "status": 404 },
+    { "src": "^/(?!aecproject)(.*)$", "status": 404 },
+
+    { "src": "^/aecproject$", "status": 308, "headers": { "Location": "/aecproject/" } },
+    { "src": "^/aecproject/(.*)$", "dest": "/$1" }
   ]
 }
