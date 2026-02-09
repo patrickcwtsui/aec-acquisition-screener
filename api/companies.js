@@ -1,5 +1,6 @@
 // api/companies.js
 import { createClient } from "@supabase/supabase-js";
+import { isAuthed, setNoCache } from "./me.js";
 
 /**
  * Expected Supabase table:
@@ -12,41 +13,10 @@ import { createClient } from "@supabase/supabase-js";
  * We store everything under a single row id = "global".
  */
 
+const TABLE = "aec_screener_state";
 const ROW_ID = "global";
 
-function noCache(res) {
-  res.setHeader(
-    "Cache-Control",
-    "no-store, no-cache, must-revalidate, proxy-revalidate"
-  );
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("Expires", "0");
-  res.setHeader("Surrogate-Control", "no-store");
-}
-
-function readCookie(req, name) {
-  const cookie = req.headers.cookie || "";
-  const match = cookie.match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`));
-  return match ? match[1] : null;
-}
-
-function isAuthed(req) {
-  const expected = process.env.APP_PASSWORD;
-  if (!expected) return false;
-
-  const token = readCookie(req, "aec_auth");
-  if (!token) return false;
-
-  try {
-    const decoded = Buffer.from(token, "base64").toString("utf8");
-    const parts = decoded.split(":");
-    const pw = parts.slice(1).join(":");
-    return pw === expected;
-  } catch {
-    return false;
-  }
-}
-
+/* --------------------------- body parsing --------------------------- */
 async function readJsonBody(req) {
   // Vercel sometimes provides req.body already
   if (req.body && typeof req.body === "object") return req.body;
@@ -64,8 +34,11 @@ async function readJsonBody(req) {
   });
 }
 
+/* --------------------------- supabase client --------------------------- */
 function getSupabase() {
   const url = process.env.SUPABASE_URL;
+
+  // IMPORTANT: on serverless, prefer SERVICE ROLE. Do NOT use anon in production for writes.
   const key =
     process.env.SUPABASE_SERVICE_ROLE_KEY ||
     process.env.SUPABASE_SERVICE_KEY ||
@@ -82,22 +55,17 @@ function getSupabase() {
   });
 }
 
+/* --------------------------- normalization --------------------------- */
 function normalizeCompany(input) {
-  // Your payload sometimes looks like:
+  // Accepts shapes like:
   // { id, name, data: { revenueM, employees, ... } }
-  // and sometimes also includes fields at top-level.
+  // { id, name, revenueM, employees, ... }
+  // and merges `data` into top-level, then removes `data`.
   const data = input?.data && typeof input.data === "object" ? input.data : {};
-
-  const merged = {
-    ...data,
-    ...input,
-  };
-
-  // Don’t keep nested "data" object in stored row
+  const merged = { ...data, ...input };
   delete merged.data;
 
-  // minimal guard
-  if (!merged.id || !merged.name) return null;
+  if (!merged?.id || !merged?.name) return null;
 
   return {
     id: String(merged.id),
@@ -110,13 +78,18 @@ function normalizeCompany(input) {
   };
 }
 
-function normalizeState(obj) {
-  // supports:
-  // { state: { companies, activeId } }
-  // { companies, activeId }
-  // { id, name, ... }  (single company upsert)
+function normalizePayload(obj) {
+  // Supports:
+  // 1) { state: { companies, activeId } }
+  // 2) { companies, activeId }
+  // 3) Single upsert: { company, activeId? } OR { id,name,... } OR { id,name,data:{...} }
+  // 4) Delete: { deleteId }
   if (!obj || typeof obj !== "object") return null;
 
+  // Delete
+  if (obj.deleteId) return { _deleteId: String(obj.deleteId) };
+
+  // Full state overwrite
   if (obj.state && typeof obj.state === "object") {
     const s = obj.state;
     return {
@@ -124,7 +97,6 @@ function normalizeState(obj) {
       activeId: s.activeId ?? null,
     };
   }
-
   if (Array.isArray(obj.companies)) {
     return {
       companies: obj.companies,
@@ -132,22 +104,68 @@ function normalizeState(obj) {
     };
   }
 
-  const single = normalizeCompany(obj);
-  if (single) {
-    return { _singleCompany: single };
+  // Single upsert
+  if (obj.company && typeof obj.company === "object") {
+    const c = normalizeCompany(obj.company);
+    if (!c) return null;
+    return { _singleCompany: c, activeId: obj.activeId ?? null };
   }
 
-  if (obj.deleteId) {
-    return { _deleteId: String(obj.deleteId) };
-  }
+  const single = normalizeCompany(obj);
+  if (single) return { _singleCompany: single, activeId: obj.activeId ?? null };
 
   return null;
 }
 
-export default async function handler(req, res) {
-  noCache(res);
+function sanitizeState(state) {
+  const s = state && typeof state === "object" ? state : {};
+  return {
+    companies: Array.isArray(s.companies) ? s.companies : [],
+    activeId: s.activeId ?? null,
+  };
+}
 
-  // Auth gate (same cookie as /api/me)
+/* --------------------------- db helpers --------------------------- */
+async function loadState(supabase) {
+  const { data, error } = await supabase
+    .from(TABLE)
+    .select("state")
+    .eq("id", ROW_ID)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  return sanitizeState(data?.state);
+}
+
+async function saveState(supabase, state) {
+  const payload = { id: ROW_ID, state: sanitizeState(state) };
+
+  // SELECT after UPSERT so we know the row exists and can return a normalized state
+  const { data, error } = await supabase
+    .from(TABLE)
+    .upsert(payload, { onConflict: "id" })
+    .select("state")
+    .single();
+
+  if (error) throw error;
+
+  return sanitizeState(data?.state);
+}
+
+function upsertCompany(companies, company) {
+  const next = Array.isArray(companies) ? companies.slice() : [];
+  const idx = next.findIndex((c) => String(c?.id) === String(company?.id));
+  if (idx >= 0) next[idx] = company;
+  else next.unshift(company);
+  return next;
+}
+
+/* --------------------------- handler --------------------------- */
+export default async function handler(req, res) {
+  setNoCache(res);
+
+  // Auth gate
   if (!isAuthed(req)) {
     return res.status(401).json({ ok: false, error: "Not authorized" });
   }
@@ -159,99 +177,67 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: e.message });
   }
 
-  // Helper: read current state
-  async function loadState() {
-    const { data, error } = await supabase
-      .from("aec_screener_state")
-      .select("state")
-      .eq("id", ROW_ID)
-      .maybeSingle();
-
-    if (error) throw error;
-
-    const state = data?.state && typeof data.state === "object" ? data.state : {};
-    return {
-      companies: Array.isArray(state.companies) ? state.companies : [],
-      activeId: state.activeId ?? null,
-    };
-  }
-
-  // Helper: save state
-  async function saveState(state) {
-    const payload = {
-      id: ROW_ID,
-      state: {
-        companies: Array.isArray(state.companies) ? state.companies : [],
-        activeId: state.activeId ?? null,
-      },
-    };
-
-    const { error } = await supabase
-      .from("aec_screener_state")
-      .upsert(payload, { onConflict: "id" });
-
-    if (error) throw error;
-
-    return payload.state;
-  }
-
   try {
     if (req.method === "GET") {
-      const state = await loadState();
+      const state = await loadState(supabase);
       return res.status(200).json({ ok: true, state });
     }
 
     if (req.method === "POST") {
       const body = await readJsonBody(req);
-      const norm = normalizeState(body);
+      const norm = normalizePayload(body);
 
       if (!norm) {
         return res.status(400).json({
           ok: false,
           error:
-            "Invalid payload. Send {state:{companies,activeId}} or {companies,activeId} or a single company object {id,name,...}.",
+            "Invalid payload. Send {state:{companies,activeId}} or {companies,activeId} or {company:{id,name,...}} or {id,name,...} or {deleteId}.",
         });
       }
 
-      // Case A: full state overwrite
-      if (norm.companies) {
-        const next = await saveState({
+      // A) full state overwrite
+      if (Object.prototype.hasOwnProperty.call(norm, "companies")) {
+        const next = await saveState(supabase, {
           companies: norm.companies,
           activeId: norm.activeId ?? null,
         });
         return res.status(200).json({ ok: true, state: next });
       }
 
-      // Case B: delete one company
+      // B) delete one company
       if (norm._deleteId) {
-        const current = await loadState();
+        const current = await loadState(supabase);
         const nextCompanies = current.companies.filter(
-          (c) => String(c.id) !== norm._deleteId
+          (c) => String(c?.id) !== norm._deleteId
         );
         const nextActive =
           current.activeId && String(current.activeId) === norm._deleteId
             ? nextCompanies[0]?.id ?? null
             : current.activeId;
 
-        const next = await saveState({ companies: nextCompanies, activeId: nextActive });
+        const next = await saveState(supabase, {
+          companies: nextCompanies,
+          activeId: nextActive,
+        });
         return res.status(200).json({ ok: true, state: next });
       }
 
-      // Case C: single company upsert (YOUR CURRENT FRONTEND BEHAVIOR)
+      // C) single company upsert (frontend expects company returned)
       if (norm._singleCompany) {
-        const current = await loadState();
+        const current = await loadState(supabase);
 
-        const nextCompanies = current.companies.slice();
-        const idx = nextCompanies.findIndex(
-          (c) => String(c.id) === String(norm._singleCompany.id)
-        );
-        if (idx >= 0) nextCompanies[idx] = norm._singleCompany;
-        else nextCompanies.unshift(norm._singleCompany);
+        const nextCompanies = upsertCompany(current.companies, norm._singleCompany);
 
-        const nextActive = current.activeId ?? norm._singleCompany.id;
+        // honor explicit activeId if sent, else keep existing, else set to this company
+        const nextActive = norm.activeId ?? current.activeId ?? norm._singleCompany.id;
 
-        const next = await saveState({ companies: nextCompanies, activeId: nextActive });
-        return res.status(200).json({ ok: true, state: next });
+        const next = await saveState(supabase, {
+          companies: nextCompanies,
+          activeId: nextActive,
+        });
+
+        // IMPORTANT: return `company` so UI doesn't show "save failed (no company returned)"
+        return res.status(200).json({ ok: true, company: norm._singleCompany, state: next });
       }
 
       return res.status(400).json({ ok: false, error: "Unhandled payload type" });
