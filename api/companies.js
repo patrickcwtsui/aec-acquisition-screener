@@ -1,6 +1,6 @@
 // api/companies.js
-import { createClient } from "@supabase/supabase-js";
-import { isAuthed } from "./me.js";
+const { createClient } = require("@supabase/supabase-js");
+const { isAuthed } = require("./me.js");
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -9,20 +9,13 @@ const supabase = createClient(
 
 const TABLE = "aec_companies";
 
-export default async function handler(req, res) {
-  // ✅ Prevent stale lists from being cached anywhere (browser/Vercel/edge)
-  res.setHeader(
-    "Cache-Control",
-    "no-store, no-cache, must-revalidate, proxy-revalidate"
-  );
+module.exports = async (req, res) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
   res.setHeader("Pragma", "no-cache");
   res.setHeader("Expires", "0");
   res.setHeader("Surrogate-Control", "no-store");
 
-  // ✅ Auth gate (skip on localhost only if you do that elsewhere; safest to enforce here)
-  if (!isAuthed(req)) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
+  if (!isAuthed(req)) return res.status(401).json({ error: "Unauthorized" });
 
   try {
     if (req.method === "GET") {
@@ -32,7 +25,6 @@ export default async function handler(req, res) {
         .order("updated_at", { ascending: false });
 
       if (error) return res.status(500).json({ error: error.message });
-
       return res.status(200).json({ companies: data || [] });
     }
 
@@ -41,16 +33,12 @@ export default async function handler(req, res) {
         typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body || {};
 
       const payload = {
-        id: body.id || undefined, // allow insert without id
+        id: body.id || undefined,
         name: body.name || "",
         data: body.data || {},
       };
 
-      if (!payload.name.trim()) {
-        return res.status(400).json({ error: "Company name is required" });
-      }
-
-      // If id is missing, let Supabase generate one (uuid default)
+      if (!payload.name.trim()) return res.status(400).json({ error: "Company name is required" });
       if (!payload.id) delete payload.id;
 
       const { data, error } = await supabase
@@ -60,7 +48,6 @@ export default async function handler(req, res) {
         .single();
 
       if (error) return res.status(500).json({ error: error.message });
-
       return res.status(200).json({ company: data });
     }
 
@@ -68,4 +55,4 @@ export default async function handler(req, res) {
   } catch (e) {
     return res.status(500).json({ error: e?.message || "Server error" });
   }
-}
+};
