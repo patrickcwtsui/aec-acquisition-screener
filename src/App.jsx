@@ -7,26 +7,32 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
  * - Company fields: name, revenue, employees, HQ location
  * - 9 questions with granular responses (mapped to numeric scores)
  * - Auto tiering + CSV export
- * - LocalStorage persistence
- * - Optional password gate (bypassed on localhost)
+ * - Persistence:
+ *    - localhost: LocalStorage
+ *    - production: Supabase via /api/companies + /api/company-delete (gated by password cookie)
+ * - Cross-browser sync:
+ *    - Refresh button
+ *    - Auto refresh every 10s (production only)
  */
 
+/* ----------------------------- Environment Helpers ----------------------------- */
+const isLocalhost =
+  typeof window !== "undefined" &&
+  (window.location.hostname === "localhost" ||
+    window.location.hostname === "127.0.0.1");
+
 /* ----------------------------- Auth Gate ----------------------------- */
-function AuthGate({ children }) {
+function AuthGate({ children, onAuthedChange }) {
   const [checking, setChecking] = useState(true);
   const [authed, setAuthed] = useState(false);
   const [password, setPassword] = useState("");
   const [err, setErr] = useState("");
 
-  const isLocalhost =
-    typeof window !== "undefined" &&
-    (window.location.hostname === "localhost" ||
-      window.location.hostname === "127.0.0.1");
-
   async function check() {
     if (isLocalhost) {
       setAuthed(true);
       setChecking(false);
+      onAuthedChange?.(true);
       return;
     }
 
@@ -35,9 +41,12 @@ function AuthGate({ children }) {
     try {
       const r = await fetch("/api/me", { credentials: "include" });
       const j = await r.json();
-      setAuthed(!!j.authed);
+      const ok = !!j.authed;
+      setAuthed(ok);
+      onAuthedChange?.(ok);
     } catch {
       setAuthed(false);
+      onAuthedChange?.(false);
     } finally {
       setChecking(false);
     }
@@ -71,8 +80,18 @@ function AuthGate({ children }) {
 
   async function logout() {
     if (isLocalhost) return;
-    await fetch("/api/logout", { credentials: "include" });
-    await check();
+
+    // Call server logout (clears cookie)
+    try {
+      await fetch("/api/logout", { credentials: "include" });
+    } catch {
+      // ignore network errors; still flip UI state
+    }
+
+    // IMPORTANT: force UI to login screen immediately
+    setAuthed(false);
+    setChecking(false);
+    onAuthedChange?.(false);
   }
 
   if (checking) {
@@ -121,15 +140,6 @@ function AuthGate({ children }) {
 }
 
 /* ----------------------------- Scoring Model ----------------------------- */
-/**
- * 4 dimensions:
- * - Fit (strategic + product adjacencies)
- * - Risk (downside / diligence flags)
- * - Momentum (growth / pull / timing)
- * - Readiness (integration + process + data)
- *
- * Each question maps to ONE primary dimension.
- */
 const DIMENSIONS = ["Fit", "Risk", "Momentum", "Readiness"];
 
 const QUESTIONS = [
@@ -137,7 +147,8 @@ const QUESTIONS = [
     key: "q1",
     dimension: "Fit",
     title: "Strategic adjacency to our platform",
-    prompt: "How directly does this target expand or strengthen our core AEC thesis?",
+    prompt:
+      "How directly does this target expand or strengthen our core AEC thesis?",
     options: [
       { label: "Direct core adjacency (same buyer + workflow)", score: 10 },
       { label: "Strong adjacency (shared buyer, nearby workflow)", score: 8 },
@@ -252,7 +263,6 @@ const QUESTIONS = [
   },
 ];
 
-// Dimension weights -> normalized automatically
 const DIMENSION_WEIGHTS = {
   Fit: 0.35,
   Risk: 0.25,
@@ -260,7 +270,6 @@ const DIMENSION_WEIGHTS = {
   Readiness: 0.20,
 };
 
-// Tier thresholds (0-100)
 const TIERS = [
   { key: "tier1", name: "Tier 1", min: 78 },
   { key: "tier2", name: "Tier 2", min: 62 },
@@ -284,7 +293,7 @@ function formatRevenue(v) {
   if (v === "" || v === null || v === undefined) return "";
   const n = Number(v);
   if (!Number.isFinite(n)) return String(v);
-  // revenue in USD millions for simplicity
+  // still stored as $M in the data model
   if (n >= 1000) return `$${(n / 1000).toFixed(2)}B`;
   return `$${n.toFixed(0)}M`;
 }
@@ -305,14 +314,12 @@ function computeScores(company) {
     if (score !== null) dimToScores[q.dimension].push(score);
   }
 
-  // average per dimension (0..10)
   const dimAvg10 = {};
   for (const d of DIMENSIONS) {
     const arr = dimToScores[d];
     dimAvg10[d] = arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
   }
 
-  // weighted -> 0..100
   const weightSum = Object.values(DIMENSION_WEIGHTS).reduce((a, b) => a + b, 0);
   let total01 = 0;
   for (const d of DIMENSIONS) {
@@ -349,19 +356,160 @@ function downloadText(filename, text) {
   URL.revokeObjectURL(url);
 }
 
+/* ----------------------------- API (Supabase-backed) ----------------------------- */
+function normalizeCompanyFromServer(row) {
+  const d = row?.data || {};
+  return {
+    id: row.id,
+    name: row.name ?? "",
+    revenueM: d.revenueM ?? "",
+    employees: d.employees ?? "",
+    hq: d.hq ?? "",
+    notes: d.notes ?? "",
+    answers: d.answers ?? {},
+  };
+}
+
+function toServerPayload(company) {
+  return {
+    id: company.id && String(company.id).length >= 10 ? company.id : undefined,
+    name: (company.name || "").trim(),
+    data: {
+      revenueM: company.revenueM ?? "",
+      employees: company.employees ?? "",
+      hq: company.hq ?? "",
+      notes: company.notes ?? "",
+      answers: company.answers ?? {},
+    },
+  };
+}
+
+async function apiListCompanies() {
+  const r = await fetch("/api/companies", { credentials: "include" });
+  if (!r.ok) throw new Error(`Load failed (${r.status})`);
+  const j = await r.json();
+  return Array.isArray(j.companies) ? j.companies : [];
+}
+
+async function apiUpsertCompany(company) {
+  const r = await fetch("/api/companies", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify(toServerPayload(company)),
+  });
+  if (!r.ok) throw new Error(`Save failed (${r.status})`);
+  const j = await r.json();
+  if (!j.company) throw new Error("Save failed (no company returned)");
+  return j.company;
+}
+
+async function apiDeleteCompany(id) {
+  const r = await fetch("/api/company-delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ id }),
+  });
+  if (!r.ok) throw new Error(`Delete failed (${r.status})`);
+  const j = await r.json();
+  if (!j.ok) throw new Error("Delete failed");
+}
+
 /* ----------------------------- App ----------------------------- */
 export default function App() {
   const [companies, setCompanies] = useState([]);
   const [activeId, setActiveId] = useState(null);
 
-  // “Add company” inline fields
   const [newName, setNewName] = useState("");
   const [newRevenue, setNewRevenue] = useState("");
   const [newEmployees, setNewEmployees] = useState("");
   const [newHQ, setNewHQ] = useState("");
 
-  // persistence
+  const [authed, setAuthed] = useState(isLocalhost);
+  const [loadingData, setLoadingData] = useState(false);
+  const [dataErr, setDataErr] = useState("");
+
+  const saveTimersRef = useRef(new Map());
+  const latestCompaniesRef = useRef(companies);
   useEffect(() => {
+    latestCompaniesRef.current = companies;
+  }, [companies]);
+
+  function clearSaveTimer(id) {
+    const t = saveTimersRef.current.get(id);
+    if (t) {
+      clearTimeout(t);
+      saveTimersRef.current.delete(id);
+    }
+  }
+
+  function scheduleSave(companyId, delayMs = 650) {
+    if (isLocalhost) return;
+    if (!authed) return;
+
+    clearSaveTimer(companyId);
+
+    const t = setTimeout(async () => {
+      try {
+        const c = latestCompaniesRef.current.find((x) => x.id === companyId);
+        if (!c) return;
+
+        const name = (c.name || "").trim();
+        if (!name) return;
+
+        const saved = await apiUpsertCompany(c);
+        const normalized = normalizeCompanyFromServer(saved);
+
+        setCompanies((prev) => {
+          const idx = prev.findIndex((x) => x.id === companyId);
+          if (idx === -1) return prev;
+          const before = prev[idx];
+          const nextId = normalized.id;
+          const merged = { ...before, ...normalized, id: nextId };
+          const out = prev.slice();
+          out[idx] = merged;
+          return out;
+        });
+
+        setActiveId((prevActive) =>
+          prevActive === companyId ? normalized.id : prevActive
+        );
+
+        setDataErr("");
+      } catch (e) {
+        setDataErr(e.message || "Save failed.");
+      }
+    }, delayMs);
+
+    saveTimersRef.current.set(companyId, t);
+  }
+
+  async function loadFromServer() {
+    setLoadingData(true);
+    setDataErr("");
+    try {
+      const rows = await apiListCompanies();
+      const normalized = rows.map(normalizeCompanyFromServer);
+
+      setCompanies(normalized);
+      setActiveId((prev) => {
+        if (prev && normalized.some((c) => c.id === prev)) return prev;
+        return normalized[0]?.id || null;
+      });
+    } catch (e) {
+      setDataErr(e.message || "Load failed.");
+      setCompanies([]);
+      setActiveId(null);
+    } finally {
+      setLoadingData(false);
+    }
+  }
+
+  /* ---------- Localhost: LocalStorage ---------- */
+  useEffect(() => {
+    if (!isLocalhost) return;
+
     try {
       const raw = localStorage.getItem(LS_KEY);
       if (raw) {
@@ -372,22 +520,39 @@ export default function App() {
           return;
         }
       }
-    } catch {
-      // ignore
-    }
+    } catch {}
 
-    // default empty state
     setCompanies([]);
     setActiveId(null);
   }, []);
 
   useEffect(() => {
+    if (!isLocalhost) return;
     try {
       localStorage.setItem(LS_KEY, JSON.stringify({ companies, activeId }));
-    } catch {
-      // ignore
-    }
+    } catch {}
   }, [companies, activeId]);
+
+  /* ---------- Production: load after auth ---------- */
+  useEffect(() => {
+    if (isLocalhost) return;
+    if (!authed) return;
+    loadFromServer();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authed]);
+
+  /* ---------- Production: auto refresh every 10s ---------- */
+  useEffect(() => {
+    if (isLocalhost) return;
+    if (!authed) return;
+
+    const t = setInterval(() => {
+      loadFromServer();
+    }, 10000);
+
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authed]);
 
   const activeCompany = useMemo(
     () => companies.find((c) => c.id === activeId) || null,
@@ -410,14 +575,15 @@ export default function App() {
     return buckets;
   }, [scoredCompanies]);
 
-  function addCompany() {
+  async function addCompany() {
     const name = newName.trim();
     if (!name) return;
 
+    const tempId = uid();
     const c = {
-      id: uid(),
+      id: tempId,
       name,
-      revenueM: safeNum(newRevenue) === "" ? "" : Number(newRevenue), // store as $M
+      revenueM: safeNum(newRevenue) === "" ? "" : Number(newRevenue),
       employees: safeNum(newEmployees) === "" ? "" : Number(newEmployees),
       hq: newHQ.trim(),
       notes: "",
@@ -425,27 +591,64 @@ export default function App() {
     };
 
     setCompanies((prev) => [c, ...prev]);
-    setActiveId(c.id);
+    setActiveId(tempId);
 
     setNewName("");
     setNewRevenue("");
     setNewEmployees("");
     setNewHQ("");
+
+    if (!isLocalhost) {
+      try {
+        const saved = await apiUpsertCompany(c);
+        const normalized = normalizeCompanyFromServer(saved);
+
+        setCompanies((prev) => {
+          const idx = prev.findIndex((x) => x.id === tempId);
+          if (idx === -1) return prev;
+          const out = prev.slice();
+          out[idx] = { ...out[idx], ...normalized, id: normalized.id };
+          return out;
+        });
+
+        setActiveId((prevActive) =>
+          prevActive === tempId ? normalized.id : prevActive
+        );
+      } catch (e) {
+        setDataErr(e.message || "Save failed.");
+      }
+    }
   }
 
-  function removeCompany(id) {
+  async function removeCompany(id) {
+    clearSaveTimer(id);
+
     setCompanies((prev) => prev.filter((c) => c.id !== id));
-    if (activeId === id) {
+
+    setActiveId((prevActive) => {
+      if (prevActive !== id) return prevActive;
       const remaining = companies.filter((c) => c.id !== id);
-      setActiveId(remaining[0]?.id || null);
+      return remaining[0]?.id || null;
+    });
+
+    if (!isLocalhost) {
+      try {
+        await apiDeleteCompany(id);
+      } catch (e) {
+        setDataErr(e.message || "Delete failed.");
+      }
     }
   }
 
   function updateActive(patch) {
     if (!activeCompany) return;
+    const id = activeCompany.id;
+
     setCompanies((prev) =>
-      prev.map((c) => (c.id === activeCompany.id ? { ...c, ...patch } : c))
+      prev.map((c) => (c.id === id ? { ...c, ...patch } : c))
     );
+
+    scheduleSave(id);
   }
 
   function setAnswer(qKey, optionLabel) {
@@ -455,17 +658,34 @@ export default function App() {
     updateActive({ answers: nextAnswers });
   }
 
-  function resetAll() {
+  async function resetAll() {
     if (!confirm("Reset everything? This clears all companies + scores.")) return;
-    setCompanies([]);
-    setActiveId(null);
-    localStorage.removeItem(LS_KEY);
+
+    if (isLocalhost) {
+      setCompanies([]);
+      setActiveId(null);
+      localStorage.removeItem(LS_KEY);
+      return;
+    }
+
+    setLoadingData(true);
+    setDataErr("");
+    try {
+      const current = latestCompaniesRef.current.slice();
+      await Promise.all(current.map((c) => apiDeleteCompany(c.id)));
+      setCompanies([]);
+      setActiveId(null);
+    } catch (e) {
+      setDataErr(e.message || "Reset failed.");
+    } finally {
+      setLoadingData(false);
+    }
   }
 
   function exportCSV() {
     const header = [
       "Company",
-      "Revenue ($M)",
+      "Revenue",
       "Employees",
       "HQ",
       "Tier",
@@ -500,28 +720,47 @@ export default function App() {
   }, [activeCompany]);
 
   return (
-    <AuthGate>
+    <AuthGate onAuthedChange={setAuthed}>
       <div style={styles.page}>
         <div style={styles.header}>
           <div>
             <div style={styles.h1}>AEC Acquisition Target Screener</div>
             <div style={styles.sub}>
-              Granular scoring across all questions (Fit / Risk / Momentum / Readiness). Saved in this browser.
+              Granular scoring across all questions (Fit / Risk / Momentum / Readiness).{" "}
+              {isLocalhost ? "Saved in this browser." : "Saved to the shared database."}
             </div>
           </div>
 
           <div style={styles.headerBtns}>
-            <button style={styles.primaryBtn} onClick={addCompany} title="Add company using fields below">
-              + Add company
-            </button>
+            {!isLocalhost ? (
+              <button style={styles.ghostBtn} onClick={loadFromServer} disabled={loadingData}>
+                Refresh data
+              </button>
+            ) : null}
+
             <button style={styles.ghostBtn} onClick={exportCSV} disabled={!companies.length}>
               Export CSV
             </button>
-            <button style={styles.dangerBtn} onClick={resetAll}>
+            <button style={styles.dangerBtn} onClick={resetAll} disabled={loadingData}>
               Reset
             </button>
           </div>
         </div>
+
+        {!isLocalhost ? (
+          <div style={{ marginBottom: 12 }}>
+            {loadingData ? (
+              <div style={styles.bannerInfo}>Loading/saving…</div>
+            ) : dataErr ? (
+              <div style={styles.bannerErr}>
+                {dataErr}
+                <button onClick={loadFromServer} style={styles.bannerBtn}>
+                  Retry load
+                </button>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
 
         <div style={styles.grid3}>
           {/* LEFT: Companies */}
@@ -543,7 +782,7 @@ export default function App() {
                   />
                 </div>
                 <div>
-                  <div style={styles.label}>Revenue ($M)</div>
+                  <div style={styles.label}>Revenue</div>
                   <input
                     style={styles.input}
                     value={newRevenue}
@@ -573,7 +812,7 @@ export default function App() {
                 </div>
               </div>
               <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
-                <button style={styles.primaryBtn} onClick={addCompany}>
+                <button style={styles.primaryBtn} onClick={addCompany} disabled={loadingData}>
                   Add
                 </button>
                 <div style={styles.muted}>
@@ -647,11 +886,18 @@ export default function App() {
 
                 <div style={styles.formGrid3}>
                   <div>
-                    <div style={styles.label}>Revenue ($M)</div>
+                    <div style={styles.label}>Revenue</div>
                     <input
                       style={styles.input}
                       value={activeCompany.revenueM === "" ? "" : String(activeCompany.revenueM)}
-                      onChange={(e) => updateActive({ revenueM: safeNum(e.target.value) === "" ? "" : Number(e.target.value) })}
+                      onChange={(e) =>
+                        updateActive({
+                          revenueM:
+                            safeNum(e.target.value) === ""
+                              ? ""
+                              : Number(e.target.value),
+                        })
+                      }
                       placeholder="e.g., 35"
                       inputMode="numeric"
                     />
@@ -661,7 +907,14 @@ export default function App() {
                     <input
                       style={styles.input}
                       value={activeCompany.employees === "" ? "" : String(activeCompany.employees)}
-                      onChange={(e) => updateActive({ employees: safeNum(e.target.value) === "" ? "" : Number(e.target.value) })}
+                      onChange={(e) =>
+                        updateActive({
+                          employees:
+                            safeNum(e.target.value) === ""
+                              ? ""
+                              : Number(e.target.value),
+                        })
+                      }
                       placeholder="e.g., 120"
                       inputMode="numeric"
                     />
@@ -1132,7 +1385,6 @@ const styles = {
 
   footerNote: { marginTop: 12, color: "#777", fontSize: 12 },
 
-  // Auth styles
   authWrap: { minHeight: "100vh", display: "grid", placeItems: "center", padding: 24, background: "#fafafa" },
   authCard: { width: "min(420px, 100%)", border: "1px solid #eee", borderRadius: 16, padding: 18, background: "white" },
   authTitle: { fontSize: 20, fontWeight: 900, marginBottom: 8 },
@@ -1140,4 +1392,35 @@ const styles = {
   err: { color: "#b00020", fontSize: 13 },
 
   logoutWrap: { position: "fixed", top: 10, right: 10, zIndex: 9999 },
+
+  bannerInfo: {
+    border: "1px solid #eee",
+    background: "#fff",
+    borderRadius: 12,
+    padding: "10px 12px",
+    color: "#333",
+    fontSize: 13,
+  },
+  bannerErr: {
+    border: "1px solid #ffe0e0",
+    background: "#fff5f5",
+    borderRadius: 12,
+    padding: "10px 12px",
+    color: "#b00020",
+    fontSize: 13,
+    display: "flex",
+    justifyContent: "space-between",
+    gap: 12,
+    alignItems: "center",
+  },
+  bannerBtn: {
+    border: "1px solid #ffd3d3",
+    background: "white",
+    borderRadius: 10,
+    padding: "8px 10px",
+    cursor: "pointer",
+    fontWeight: 900,
+    color: "#b00020",
+    whiteSpace: "nowrap",
+  },
 };
