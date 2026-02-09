@@ -1,59 +1,71 @@
-import { supabaseAdmin } from "./_supabase.js";
-import { isAuthed } from "./_auth.js";
+// api/companies.js
+import { createClient } from "@supabase/supabase-js";
+import { isAuthed } from "./me.js";
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+const TABLE = "aec_companies";
 
 export default async function handler(req, res) {
-  if (!isAuthed(req)) {
-    return res.status(401).json({ error: "Not authenticated" });
-  }
+  // ✅ Prevent stale lists from being cached anywhere (browser/Vercel/edge)
+  res.setHeader(
+    "Cache-Control",
+    "no-store, no-cache, must-revalidate, proxy-revalidate"
+  );
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  res.setHeader("Surrogate-Control", "no-store");
 
-  const supabase = supabaseAdmin();
+  // ✅ Auth gate (skip on localhost only if you do that elsewhere; safest to enforce here)
+  if (!isAuthed(req)) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
 
   try {
     if (req.method === "GET") {
       const { data, error } = await supabase
-        .from("companies")
-        .select("id,name,data,created_at,updated_at")
+        .from(TABLE)
+        .select("*")
         .order("updated_at", { ascending: false });
 
-      if (error) throw error;
+      if (error) return res.status(500).json({ error: error.message });
+
       return res.status(200).json({ companies: data || [] });
     }
 
     if (req.method === "POST") {
-      // NOTE: Vercel usually parses JSON automatically, but your login handler doesn’t.
-      // To be safe, accept either.
       const body =
         typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body || {};
 
-      const { id, name, data } = body;
-
-      if (!name || !String(name).trim()) {
-        return res.status(400).json({ error: "Missing name" });
-      }
-
       const payload = {
-        ...(id ? { id } : {}),
-        name: String(name).trim(),
-        data: data ?? {},
+        id: body.id || undefined, // allow insert without id
+        name: body.name || "",
+        data: body.data || {},
       };
 
-      const { data: saved, error } = await supabase
-        .from("companies")
-        .upsert(payload, { onConflict: "name" })
-        .select("id,name,data,created_at,updated_at")
+      if (!payload.name.trim()) {
+        return res.status(400).json({ error: "Company name is required" });
+      }
+
+      // If id is missing, let Supabase generate one (uuid default)
+      if (!payload.id) delete payload.id;
+
+      const { data, error } = await supabase
+        .from(TABLE)
+        .upsert(payload, { onConflict: "id" })
+        .select("*")
         .single();
 
-      if (error) throw error;
-      return res.status(200).json({ company: saved });
+      if (error) return res.status(500).json({ error: error.message });
+
+      return res.status(200).json({ company: data });
     }
 
-    res.setHeader("Allow", ["GET", "POST"]);
     return res.status(405).send("Method Not Allowed");
   } catch (e) {
-    return res.status(500).json({ error: e.message || "Server error" });
+    return res.status(500).json({ error: e?.message || "Server error" });
   }
 }
-res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-res.setHeader("Pragma", "no-cache");
-res.setHeader("Expires", "0");
-res.setHeader("Surrogate-Control", "no-store");
